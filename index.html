@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
@@ -269,6 +269,7 @@ tbody tr:hover td { background: var(--gray-50); }
       <span class="topbar-sub" id="topbarSub">Resumen general</span>
     </div>
     <div class="topbar-right">
+      <span id="syncStatusBadge" style="font-size:11px;color:var(--gray-400);font-weight:500;"></span>
       <span class="year-badge">Año 2026</span>
     </div>
   </header>
@@ -1066,65 +1067,84 @@ function confirmarEliminarMovCajaChica(idx) {
 // ── PERSISTENCIA ────────────────────────────────────────
 const STORAGE_KEY = 'flosan_data_v1';
 
-// ── SUPABASE ─────────────────────────────────────────────
+// ── SUPABASE ──────────────────────────────────────────────
 // Reemplaza estos dos valores con los de tu proyecto Supabase
 // (Project Settings → API → Project URL / anon public key).
 const SUPABASE_URL = 'https://oxpnbssckxmlzagwazij.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_k_8JY1LPAFqPzdIlp9363g_WmnymAMi';
-// ID de la fila donde vive el estado del dashboard de finanzas.
-// Debe coincidir con lo que uses en la tabla flosan_finanzas_state.
-const SUPABASE_STATE_ID = 'default';
 
-const supabaseClient = (SUPABASE_URL.includes('TU-PROYECTO'))
-  ? null
-  : window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Identificador fijo de la fila que guarda todo el estado del dashboard.
+// Si algún día quieres varias "instancias" del dashboard, cambia este valor.
+const SUPABASE_ROW_ID = 'flosan_finanzas_main';
 
-let _syncTimeout = null;
-let _lastSyncedPayloadStr = null;
-
-// Sube el payload actual (el mismo que se guarda en localStorage) a Supabase,
-// con un pequeño debounce para no disparar una llamada de red en cada tecla.
-function syncToSupabaseDebounced(payload) {
-  if (!supabaseClient) return; // Supabase aún no configurado
-  clearTimeout(_syncTimeout);
-  _syncTimeout = setTimeout(async () => {
-    const payloadStr = JSON.stringify(payload);
-    if (payloadStr === _lastSyncedPayloadStr) return; // sin cambios reales
-    try {
-      const { error } = await supabaseClient
-        .from('flosan_finanzas_state')
-        .upsert({ id: SUPABASE_STATE_ID, data: payload, updated_at: new Date().toISOString() });
-      if (error) {
-        console.warn('No se pudo sincronizar con Supabase:', error.message);
-      } else {
-        _lastSyncedPayloadStr = payloadStr;
-      }
-    } catch (e) {
-      console.warn('Error de red al sincronizar con Supabase:', e);
-    }
-  }, 900);
+let supabaseClient = null;
+if (SUPABASE_URL && !SUPABASE_URL.includes('TU-PROYECTO') && window.supabase) {
+  supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 }
 
-// Intenta traer el estado más reciente desde Supabase. Devuelve el payload
-// o null si no hay conexión / no hay fila todavía (usamos localStorage como respaldo).
-async function cargarDesdeSupabase() {
+// Estado de conexión visible en la topbar (ver setSyncStatus).
+let syncEnabled = !!supabaseClient;
+let syncTimer = null;
+let syncInFlight = false;
+let syncPending = false;
+
+function setSyncStatus(text, color) {
+  const el = document.getElementById('syncStatusBadge');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = color || '';
+}
+
+// Sube el payload completo a Supabase (upsert sobre una sola fila).
+// Se llama con debounce desde guardarDatos() para no saturar la red
+// mientras el usuario escribe.
+async function syncToSupabase(payload) {
+  if (!supabaseClient) return;
+  if (syncInFlight) { syncPending = true; return; }
+  syncInFlight = true;
+  setSyncStatus('Guardando…', '#d97706');
+  try {
+    const { error } = await supabaseClient
+      .from('flosan_finanzas_state')
+      .upsert({ id: SUPABASE_ROW_ID, data: payload, updated_at: new Date().toISOString() });
+    if (error) throw error;
+    setSyncStatus('Guardado en la nube ✓', '#16a34a');
+  } catch (e) {
+    console.warn('No se pudo sincronizar con Supabase:', e);
+    setSyncStatus('Sin conexión (guardado local)', '#dc2626');
+  } finally {
+    syncInFlight = false;
+    if (syncPending) { syncPending = false; syncToSupabase(payload); }
+  }
+}
+
+function guardarDatosEnSupabase(payload) {
+  if (!supabaseClient) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => syncToSupabase(payload), 800);
+}
+
+// Intenta traer el estado desde Supabase. Devuelve el payload si existe,
+// o null si no hay fila todavía / no hay conexión configurada.
+async function cargarDatosDesdeSupabase() {
   if (!supabaseClient) return null;
   try {
+    setSyncStatus('Cargando desde la nube…', '#d97706');
     const { data, error } = await supabaseClient
       .from('flosan_finanzas_state')
       .select('data')
-      .eq('id', SUPABASE_STATE_ID)
+      .eq('id', SUPABASE_ROW_ID)
       .maybeSingle();
-    if (error) {
-      console.warn('No se pudo leer Supabase, uso localStorage:', error.message);
-      return null;
-    }
+    if (error) throw error;
+    setSyncStatus(data ? 'Conectado a Supabase ✓' : 'Conectado (sin datos aún)', '#16a34a');
     return data ? data.data : null;
   } catch (e) {
-    console.warn('Error de red leyendo Supabase, uso localStorage:', e);
+    console.warn('No se pudo cargar desde Supabase:', e);
+    setSyncStatus('Sin conexión (usando datos locales)', '#dc2626');
     return null;
   }
 }
+// ── FIN SUPABASE ──────────────────────────────────────────
 
 // ── NÓMINA: catálogo de puestos y sueldos fijos ─────────
 const NOMINA_PUESTOS = {
@@ -1152,17 +1172,17 @@ function guardarDatos() {
       nominaEmpleadoIdSeq: nominaEmpleadoIdSeq
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-    syncToSupabaseDebounced(payload);
+    guardarDatosEnSupabase(payload);
   } catch(e) { console.warn('No se pudo guardar:', e); }
 }
 
 async function cargarDatos() {
   try {
-    const remoto = await cargarDesdeSupabase();
-    const raw = remoto ? JSON.stringify(remoto) : localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    if (remoto) localStorage.setItem(STORAGE_KEY, raw); // mantener caché local al día
-    const payload = JSON.parse(raw);
+    const remoto = await cargarDatosDesdeSupabase();
+    const raw = remoto ? null : localStorage.getItem(STORAGE_KEY);
+    if (!remoto && !raw) return;
+    const payload = remoto || JSON.parse(raw);
+    if (remoto) localStorage.setItem(STORAGE_KEY, JSON.stringify(remoto));
     if (payload.modules) {
       payload.modules.forEach(saved => {
         const m = MODULES.find(x => x.id === saved.id);
@@ -1731,9 +1751,9 @@ let balGenHasta = '';
 const MAQL_TIPOS = ['bailarinas','cortadora','revolvedoras','generador','vibrocompactador'];
 const MAQL_LABELS = { bailarinas:'Bailarinas', cortadora:'Cortadora', revolvedoras:'Revolvedoras', generador:'Generador de Luz', vibrocompactador:'Vibro Compactador' };
 const MAQL_COLORS = { bailarinas:{bg:'#fce7f3',text:'#be185d'}, cortadora:{bg:'#dbeafe',text:'#1d4ed8'}, revolvedoras:{bg:'#dcfce7',text:'#16a34a'}, generador:{bg:'#fef3c7',text:'#92400e'}, vibrocompactador:{bg:'#f3e8ff',text:'#7c3aed'} };
-const MAQL_RENTAS = ['horas','dia','mes'];
-const MAQL_RENTA_LABELS = { horas:'Horas', dia:'Día', mes:'Mes' };
-const MAQL_RENTA_COLORS = { horas:{bg:'#dbeafe',text:'#1d4ed8'}, dia:{bg:'#dcfce7',text:'#16a34a'}, mes:{bg:'#fef3c7',text:'#92400e'} };
+const MAQL_RENTAS = ['hora','dia','semana','mes','extra'];
+const MAQL_RENTA_LABELS = { hora:'Hora', dia:'Día', semana:'Semana', mes:'Mes', extra:'Extra' };
+const MAQL_RENTA_COLORS = { hora:{bg:'#dbeafe',text:'#1d4ed8'}, dia:{bg:'#dcfce7',text:'#16a34a'}, semana:{bg:'#f3e8ff',text:'#7c3aed'}, mes:{bg:'#fef3c7',text:'#92400e'}, extra:{bg:'#fee2e2',text:'#dc2626'} };
 
 function recalcMaqLigEnIngresos() {
   const modRentas = MODULES.find(m => m.id === 'ing_rentas');
@@ -1815,11 +1835,6 @@ function buildMaqLig() {
         </thead>
         <tbody id="maqLigTbody"></tbody>
       </table>
-      <datalist id="rentaMaqLigOpciones">
-        <option value="horas">Horas</option>
-        <option value="dia">Día</option>
-        <option value="mes">Mes</option>
-      </datalist>
     </div>
     <div id="maqLigEmpty" style="text-align:center;padding:32px;color:var(--gray-400);font-size:13px;display:none;">
       <div style="font-size:28px;margin-bottom:8px;">⚙️</div>
@@ -1867,7 +1882,7 @@ function limpiarFiltrosMaqLig() {
 
 function agregarMaqLig() {
   const hoy = new Date().toISOString().split('T')[0];
-  maqLigData.push({ fecha: hoy, cliente: '', tipo: 'bailarinas', renta: 'dia', cantidad: 0, monto: 0, montoFinal: 0 });
+  maqLigData.push({ fecha: hoy, cliente: '', tipo: 'bailarinas', renta: 'hora', rentaExtra: '', cantidad: 0, monto: 0, montoFinal: 0 });
   guardarDatos();
   renderMaqLigTable();
 }
@@ -1957,7 +1972,10 @@ function renderMaqLigTable() {
         </select>
       </td>
       <td>
-        <input class="viaje-input" type="text" data-field="renta" value="${r.renta||''}" placeholder="horas, día, mes…" list="rentaMaqLigOpciones" style="max-width:90px;" onchange="updateMaqLig(${ri},'renta',this.value)"/>
+        <select class="viaje-select-inline" data-field="renta" onchange="updateMaqLig(${ri},'renta',this.value)" style="max-width:90px;color:${rc.text};background:${rc.bg}">
+          ${MAQL_RENTAS.map(t=>`<option value="${t}" ${r.renta===t?'selected':''}>${MAQL_RENTA_LABELS[t]}</option>`).join('')}
+        </select>
+        ${r.renta==='extra' ? `<input class="viaje-input" type="text" data-field="rentaExtra" value="${r.rentaExtra||''}" placeholder="Especificar…" style="margin-top:4px;max-width:90px;display:block;" onchange="updateMaqLig(${ri},'rentaExtra',this.value)"/>` : ''}
       </td>
       <td style="text-align:right">
         <input class="editable" type="number" data-field="cantidad" value="${r.cantidad||''}" placeholder="0" style="max-width:70px;" onchange="updateMaqLig(${ri},'cantidad',this.value)"/>
@@ -3197,6 +3215,7 @@ function buildViajes() {
           <option value="todos">Todos</option>
           <option value="7m">7 M</option>
           <option value="14m">14 M</option>
+          <option value="21m">21 M</option>
         </select>
       </div>
       <div style="margin-left:auto;display:flex;align-items:center;gap:6px;">
@@ -3227,10 +3246,6 @@ function buildViajes() {
         </thead>
         <tbody id="viajesTbody"></tbody>
       </table>
-      <datalist id="metroOpciones">
-        <option value="7m">7 M</option>
-        <option value="14m">14 M</option>
-      </datalist>
     </div>
     <div id="viajesEmpty" style="text-align:center;padding:32px;color:var(--gray-400);font-size:13px;display:none;">
       <div style="font-size:28px;margin-bottom:8px;">🚛</div>
@@ -3473,6 +3488,17 @@ function renderClienteDash() {
   }).join('');
 }
 
+function handleMetroChange(ri, val) {
+  const otroInput = document.getElementById('metroOtro-'+ri);
+  if (val === 'otro') {
+    // Mostramos el campo de texto y esperamos a que el usuario escriba antes de guardar
+    if (otroInput) { otroInput.style.display = 'block'; otroInput.focus(); }
+    return;
+  }
+  if (otroInput) { otroInput.style.display = 'none'; otroInput.value = ''; }
+  updateViaje(ri, 'columna', val);
+}
+
 function updateViaje(i, campo, val) {
   viajesData[i][campo] = (campo==='monto'||campo==='montoFinal') ? (parseFloat(val)||0) : val;
   if (campo==='montoFinal' || campo==='fecha') recalcViajesEnIngresos();
@@ -3559,8 +3585,17 @@ function renderViajesTable() {
         </select>
       </td>
       <td>
-        <input class="viaje-input" type="text" data-field="columna" value="${v.columna||''}" placeholder="ej. 7m, 14m…"
-          style="max-width:80px;" list="metroOpciones"
+        <select class="viaje-select-inline" data-field="columna" style="max-width:90px;"
+          onchange="handleMetroChange(${ri},this.value)">
+          <option value="7m" ${v.columna==='7m'?'selected':''}>7 M</option>
+          <option value="14m" ${v.columna==='14m'?'selected':''}>14 M</option>
+          <option value="21m" ${v.columna==='21m'?'selected':''}>21 M</option>
+          <option value="otro" ${(v.columna && !['7m','14m','21m'].includes(v.columna))?'selected':''}>Otro...</option>
+        </select>
+        <input class="viaje-input" type="text" id="metroOtro-${ri}"
+          value="${(v.columna && !['7m','14m','21m'].includes(v.columna))?v.columna:''}"
+          placeholder="Especifica…"
+          style="max-width:90px;margin-top:4px;display:${(v.columna && !['7m','14m','21m'].includes(v.columna))?'block':'none'};"
           onchange="updateViaje(${ri},'columna',this.value)"/>
       </td>
       <td>
@@ -3602,7 +3637,7 @@ function renderViajesTable() {
 
 const VIAJE_TIPO_LABELS = { arena:'Arena', grava:'Grava', tepetate:'Tepetate', escombro:'Escombro', balastro:'Balastro' };
 const VIAJE_TIPO_COLORS = { arena:{bg:'#fef3c7',text:'#92400e'}, grava:{bg:'#e5e7eb',text:'#374151'}, tepetate:{bg:'#fed7aa',text:'#c2410c'}, escombro:{bg:'#fee2e2',text:'#dc2626'}, balastro:{bg:'#dbeafe',text:'#1d4ed8'} };
-const VIAJE_COL_COLORS = { '7m':{bg:'#dbeafe',text:'#1d4ed8'}, '14m':{bg:'#fef3c7',text:'#92400e'} };
+const VIAJE_COL_COLORS = { '7m':{bg:'#dbeafe',text:'#1d4ed8'}, '14m':{bg:'#fef3c7',text:'#92400e'}, '21m':{bg:'#dcfce7',text:'#166534'} };
 
 function imprimirCliente(nombreCliente) {
   const key = nombreCliente.trim().toLowerCase();
